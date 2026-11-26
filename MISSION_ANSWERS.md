@@ -898,6 +898,54 @@ Mẫu log JSON của app (mỗi dòng là 1 JSON object):
 
 **Điểm còn có thể cải thiện:** khi Redis bị dừng, `/ask` mất ~8 s mới trả 503 (log `"ms": 8038.4`) vì phải chờ timeout kết nối/DNS tới host `redis`. Có thể giảm bằng cách kiểm tra nhanh tình trạng Redis (circuit breaker) trước khi gọi lệnh.
 
+## Part 7: Benchmark & Observability
+
+Số liệu và phân tích đầy đủ (load test, tail latency, eval, quality gate) nằm trong [BENCHMARK_REPORT.md](BENCHMARK_REPORT.md); file JSON trong [reports/](reports/). Mục này trả lời các câu hỏi của Exercise 7.1, mà mẫu báo cáo không có chỗ.
+
+### Exercise 7.1: Đọc metrics của agent
+
+Chạy `AGENT_VERSION=v1 PORT=8001 python app.py` và `AGENT_VERSION=v2 PORT=8002 python app.py` trong `06-lab-complete/benchmark-observability/develop/`, gọi 1 câu rồi đọc `/metrics`:
+
+```text
+$ curl -s -X POST http://localhost:8002/ask -H "Content-Type: application/json" -d '{"question": "Prometheus thu thập metrics như thế nào?"}'
+{"answer":"Prometheus pull metrics bằng cách scrape endpoint /metrics theo chu kỳ. ...","model":"mock-llm-small","agent_version":"v2",
+ "usage":{"input_tokens":91,"output_tokens":55,"cost_usd":4.665e-05},"llm_latency_ms":152.2,"request_id":"62c500d902a1"}
+
+$ curl -s http://localhost:8002/metrics | grep -v "^#"
+http_requests_total{method="POST",route="/ask",status="200"} 1.0
+http_request_duration_seconds_bucket{le="0.2",method="POST",route="/ask"} 1.0
+http_request_duration_seconds_count{method="POST",route="/ask"} 1.0
+http_request_duration_seconds_sum{method="POST",route="/ask"} 0.18162324900004023
+agent_in_flight_requests 0.0
+llm_requests_total{model="mock-llm-small",status="ok"} 1.0
+llm_tokens_total{model="mock-llm-small",type="input"} 91.0
+llm_tokens_total{model="mock-llm-small",type="output"} 55.0
+llm_cost_usd_total{model="mock-llm-small"} 4.6649999999999996e-05
+agent_info{model="mock-llm-small",version="v2"} 1.0
+agent_question_length_chars_count 1.0
+agent_question_length_chars_sum 40.0
+```
+
+**1. Ví dụ cho mỗi loại metric:**
+- **Counter** (chỉ tăng, dùng với `rate()`): `http_requests_total{method="POST",route="/ask",status="200"} 1.0`; tương tự `llm_tokens_total`, `llm_cost_usd_total`, `llm_requests_total`.
+- **Gauge** (lên xuống được): `agent_in_flight_requests 0.0` (số request đang xử lý); `agent_info{...} 1.0` (gauge hằng số để gắn label version/model).
+- **Histogram** (đếm giá trị theo bucket, kèm `_sum`, `_count`, dùng `histogram_quantile()` để tính percentile): `http_request_duration_seconds_bucket{le="0.2",method="POST",route="/ask"} 1.0`, cùng `_sum` = 0.1816 s và `_count` = 1.
+
+**2. Nếu dùng URL thật (`request.url.path`) làm label `route`:** mỗi URL khác nhau tạo ra **một time series mới** cho cả `http_requests_total` lẫn **mọi bucket** của `http_request_duration_seconds` (11 bucket + `_sum` + `_count`, nhân thêm số giá trị `status`, `method`). Bot quét hàng nghìn URL lạ (`/wp-admin`, `/.env`, `/a1b2c3`...) sẽ sinh hàng chục nghìn series chỉ trong vài phút. Prometheus giữ mọi series trong RAM và index, nên tốn bộ nhớ, query chậm, có thể OOM. Đây là **cardinality explosion**, và kẻ tấn công điều khiển được nó bằng URL tuỳ ý. Dùng route template thì mọi URL lạ gộp vào một giá trị `unmatched`. Đã thử: gọi `/wp-admin`, `/.env`, `/a1b2c3` thì `/metrics` chỉ có thêm **đúng 1 series** `http_requests_total{method="GET",route="unmatched",status="404"} 3.0`.
+
+**Nhiệm vụ: thêm metric `agent_question_length_chars`.** Đã thêm vào `develop/app.py`:
+
+```python
+QUESTION_LENGTH = Histogram(
+    "agent_question_length_chars", "Độ dài câu hỏi gửi tới /ask (ký tự)",
+    buckets=(20, 50, 100, 200, 500, 1000, 2000),
+)
+# trong endpoint ask(), trước khi gọi LLM:
+QUESTION_LENGTH.observe(len(body.question))
+```
+
+Kết quả sau 1 câu hỏi 40 ký tự: `agent_question_length_chars_count 1.0`, `agent_question_length_chars_sum 40.0`. Dùng Histogram chứ không dùng label `length=...`, vì độ dài có vô số giá trị, làm label sẽ bùng nổ cardinality đúng như câu 2.
+
 ## AI log
 
 | # | Phần | Hỏi AI gì | Nhận được gì | Tôi tự sửa / tự kiểm tra thế nào |
@@ -909,3 +957,4 @@ Mẫu log JSON của app (mỗi dòng là 1 JSON object):
 | 5 | CP4 | Dùng Claude Code chạy health check, test SIGTERM giữa request, bật stack 3 instance, chạy `test_stateless.py`, thử tắt 1 instance và thử chế độ không Redis | Output health/ready, log graceful shutdown, phân bố request theo instance, history sau khi tắt instance, giải thích liveness vs readiness | Tự đếm phân bố request trong `docker compose logs`; kiểm history đủ 7 câu sau khi `docker stop` agent-2; đọc `app.py` để tìm nguyên nhân request chạy nối tiếp (sleep đồng bộ trong `async def`) và trường `turn` lệch +1 |
 | 6 | CP5 | Dùng Claude Code đọc `check_production_ready.py` và README Part 6, viết code cho mọi `TODO` trong `06-lab-complete/` (config, auth, rate limiter Redis sorted set, cost guard Redis, log JSON, health/ready, Dockerfile multi-stage, compose, deploy config) | Toàn bộ code Part 6; script chấm báo `PASS 12/12`, 43/43 checks | Chạy `--static-only` (0/12) → `--skip-docker` (10/12) → bản đầy đủ (12/12); tự test thêm bằng `docker compose`: 401/422/429/402, restart vẫn 429, dừng Redis → `/ready` 503 + `/ask` 503 không lộ stack trace, log không chứa API key, `docker stop` 1.3 s exit 0; đọc lại từng file để giải thích được luồng `/ask` và lý do `/health` không phụ thuộc Redis |
 | 7 | CP6 | Dùng Claude Code cài Railway CLI, tạo project + Redis + service agent, đặt biến môi trường, deploy, chạy 4 lệnh tự kiểm, so sánh `railway.toml`/`render.yaml`, tóm tắt pipeline Cloud Run | URL public, output 200/200/401/200, rate limit trên cloud, script chấm `--public-url` 44/44, bảng so sánh, mô tả 4 bước Cloud Build | Tự `railway login`; kiểm `REDIS_URL` trên Railway đã được resolve (không còn chuỗi `${{...}}`); key sinh ngẫu nhiên lưu trong `.env.deploy` (gitignore), đặt qua `--stdin`; tự chụp ảnh dashboard / running / test |
+| 8 | CP7 | Dùng Claude Code chạy agent v1/v2, load test 4 mức concurrency + 3 mức `MOCK_SLOW_RATE`, eval v1/v2, thêm metric `agent_question_length_chars`, sửa `KNOWLEDGE_BASE` cho 2 câu sai, viết job CI, điền mục 1–3 của `BENCHMARK_REPORT.md` | 10 file JSON trong `reports/`, phân tích RPS/percentile, 2 entry KB mới, `.github/workflows/eval.yml` | Số trong báo cáo lấy từ JSON bằng script, kiểm lại phép tính (tỉ lệ, cost / câu đúng); thấy p95 lúc PASS lúc FAIL ở `MOCK_SLOW_RATE=0.03` nên chạy thêm 3 lần, đếm tỉ lệ request chậm từ `/metrics` (4.4 % / 3.0 % / 5.4 %) để giải thích; kiểm 0 regression; chạy thử lệnh của job CI (v2 exit 0, v1 exit 1); không sửa `golden_dataset.jsonl` |

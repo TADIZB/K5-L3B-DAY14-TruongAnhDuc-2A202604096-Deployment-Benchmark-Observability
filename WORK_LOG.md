@@ -28,7 +28,7 @@ cd "/mnt/d/Coding/K5-L3B-DAY14-TruongAnhDuc-2A202604096-Deployment-Benchmark-Obs
 | CP4 · Scaling & Reliability | ✅ Xong | `MISSION_ANSWERS.md` mục Part 5 |
 | CP5 · Final Project | ✅ Xong — PASS 12/12 | Code `06-lab-complete/`, `MISSION_ANSWERS.md` mục Part 6 |
 | CP6 · Cloud Deployment | ✅ Xong (còn chụp 3 ảnh) | `DEPLOYMENT.md`, `MISSION_ANSWERS.md` mục Part 3 |
-| CP7 · Benchmark local | ⏳ | |
+| CP7 · Benchmark local | ✅ Xong | `BENCHMARK_REPORT.md` mục 1–3, `reports/` (10 JSON), `.github/workflows/eval.yml` |
 | CP8 · Observability + nộp | ⏳ | |
 
 ---
@@ -502,3 +502,95 @@ Thêm:
 - [x] `DEPLOYMENT.md`; mục Part 3 của `MISSION_ANSWERS.md` (URL, so sánh Railway/Render, Cloud Run).
 - [x] `AGENT_API_KEY`, `REDIS_URL` đặt trên Railway, không có trong code/repo (đã grep: key không xuất hiện trong file nào ngoài `.env.deploy` bị gitignore).
 - [ ] 3 ảnh trong `screenshots/`.
+
+---
+
+## CP7 — Benchmark local / Part 7 Bước 1 (2026-11-26)
+
+**Mục tiêu:** đo agent nhanh tới đâu và đúng tới đâu bằng số của chính mình.
+**Thư mục:** `06-lab-complete/benchmark-observability/develop/`. Chạy trong WSL (venv `~/venvs/day14`).
+
+### Bước 1 — Exercise 7.1: metrics
+
+- Thêm Histogram `agent_question_length_chars` (bucket 20…2000) vào `develop/app.py`, `observe(len(question))` trong `/ask`.
+- Bật v1 (8001) và v2 (8002), gọi 1 câu, đọc `/metrics`: tìm được Counter (`http_requests_total`), Gauge (`agent_in_flight_requests`), Histogram (`http_request_duration_seconds_bucket`). Metric mới hiện `_count 1.0`, `_sum 40.0`.
+- Gọi 3 URL lạ (`/wp-admin`, `/.env`, `/a1b2c3`) thì chỉ sinh 1 series `route="unmatched"`, chứng minh dùng route template chống cardinality explosion.
+
+### Bước 2 — Tạo báo cáo (một lần)
+
+```bash
+cp -n 06-lab-complete/benchmark-observability/BENCHMARK_REPORT_TEMPLATE.md BENCHMARK_REPORT.md
+```
+
+### Bước 3 — Exercise 7.2: load test
+
+```bash
+for c in 1 10 50 100; do
+  python load_test.py --url http://localhost:8002 --requests 300 --concurrency "$c" --out "reports/load_v2_c${c}.json"
+done
+# bật lại v2 với MOCK_SLOW_RATE=0 / 0.03 / 0.1, mỗi lần:
+python load_test.py --url http://localhost:8002 --requests 300 --concurrency 20 --out reports/load_v2_slow_<rate>.json
+```
+
+| File | RPS | p50 | p95 | p99 | Lỗi | SLO |
+|---|---:|---:|---:|---:|---:|---|
+| c1 | 3.54 | 194.9 | 1669.3 | 1702.6 | 0 % | FAIL |
+| c10 | 35.28 | 191.0 | 223.2 | 1693.5 | 1.00 % | PASS |
+| c50 | 110.90 | 201.3 | 265.3 | 1700.5 | 1.67 % | PASS |
+| c100 | 62.85 | 390.3 | 3178.9 | 3445.7 | 1.67 % | FAIL |
+| slow 0 | 101.61 | 192.5 | 219.7 | 229.2 | 0.33 % | PASS |
+| slow 0.03 | 56.80 | 196.6 | 1662.2 | 1701.7 | 1.00 % | FAIL |
+| slow 0.1 | 46.24 | 194.9 | 1688.8 | 1721.0 | 0.33 % | FAIL |
+
+Kiểm chứng thêm vì p95 lúc PASS lúc FAIL ở `MOCK_SLOW_RATE=0.03`: chạy lại 3 lần (c=20, không lưu file), đếm từ `/metrics` (`llm_request_duration_seconds` count − bucket `le="1.0"`): request chậm 4.4 % / 3.0 % / 5.4 %, p95 232.0 / 224.6 / 1659.6 ms. Vượt 5 % là p95 rơi vào nhóm chậm 1.7 s, nên đây là dao động ngẫu nhiên do mẫu nhỏ (300 request), không phải lỗi.
+
+### Bước 4 — Exercise 7.3: eval
+
+```bash
+python eval/run_eval.py --url http://localhost:8001 --out reports/eval_v1.json                                   # 1/23, exit 1
+python eval/run_eval.py --url http://localhost:8002 --out reports/eval_v2.json --baseline reports/eval_v1.json    # 21/23, exit 0
+python eval/run_eval.py --url http://localhost:8001 --baseline reports/eval_v2.json                               # exit 1, 20 regression (không lưu file)
+```
+
+v2 sai `security-02` (thiếu `token`, `hết hạn`, `chữ ký`) và `scaling-03` (thiếu `cpu`, `memory`, `custom metrics`). Cả hai đều do retrieval không khớp tài liệu nào nên agent trả câu chung chung.
+
+### Bước 5 — Sửa KNOWLEDGE_BASE, eval cuối
+
+- Thêm 2 entry vào `develop/utils/mock_llm.py`: `["hpa", "kubernetes", "autoscal"]` (HPA scale theo CPU / memory / custom metrics) và `["jwt", "api key"]` (JWT là token có chữ ký, có hạn; API key cố định, không hết hạn). Không sửa `golden_dataset.jsonl`.
+- Tắt rồi bật lại v2:
+
+```bash
+python eval/run_eval.py --url http://localhost:8002 --min-accuracy 1.0 --baseline reports/eval_v2.json --out reports/eval_v2_fixed.json
+# Accuracy 100.0% (23/23) · cải thiện 2 · regression 0 · Quality gate ✅ PASS · exit 0
+```
+
+- Chép file `mock_llm.py` đã sửa sang `production/utils/mock_llm.py` (lưu ý K5 số 10; bản production trước đó giống hệt bản develop gốc) để stack Docker ở CP8 cũng đạt 100 %.
+
+### Bước 6 — Job CI
+
+- Viết `.github/workflows/eval.yml`: chạy trên pull request đụng `develop/`, bật agent v2 với `MOCK_ERROR_RATE=0`, chạy `run_eval.py --min-accuracy 0.85`; exit code 1 thì job fail, PR bị chặn.
+- Chạy thử đúng các lệnh của job trên máy: v2 → exit **0**, v1 → exit **1**.
+
+### Bước 7 — Báo cáo và gom file
+
+- Điền `BENCHMARK_REPORT.md` mục 1 (SLO), 2.1, 2.2, 3; mục 4–6 để CP8.
+- Kiểm lại phép tính trong báo cáo bằng Python.
+- Chép JSON ra gốc repo theo SUBMISSION: `cp -r 06-lab-complete/benchmark-observability/develop/reports/. reports/`. Ở CP8 cần chép lại nếu chạy thêm.
+
+### Phát hiện thêm
+
+- `load_test.py` là closed-loop: RPS ≈ concurrency / latency. Ở c=50 với 300 request chỉ còn ~6 vòng, nên vài request 1.7 s ở cuối kéo dài tổng thời gian.
+- Ở c=100, agent 1 process bị bão hoà: p50 tăng gấp đôi, RPS giảm. Cần scale ngang (CP8 mục 5).
+- p95 của eval (23 mẫu) không đáng tin để so latency: 1 request chậm là p95 lên 1546 ms.
+
+### Lỗi gặp phải và cách xử lý
+
+| Lỗi | Xử lý |
+|---|---|
+| `python -c` trên Windows in tiếng Việt lỗi `UnicodeEncodeError: 'charmap'` | Đặt `PYTHONIOENCODING=utf-8` |
+
+### Kết quả CP7
+
+- [x] Trong `develop/reports/` có đủ: `load_v2_c1/c10/c50/c100.json`, `load_v2_slow_0/0.03/0.1.json`, `eval_v1.json`, `eval_v2.json`, `eval_v2_fixed.json` (đã chép ra `reports/` ở gốc).
+- [x] `BENCHMARK_REPORT.md` ở gốc repo đã điền mục 1–3.
+- [x] Tự kiểm tra: lệnh eval cuối in `Quality gate ... ✅ PASS` và `reports/eval_v2_fixed.json` tồn tại.
