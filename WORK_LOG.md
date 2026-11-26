@@ -25,7 +25,7 @@ cd "/mnt/d/Coding/K5-L3B-DAY14-TruongAnhDuc-2A202604096-Deployment-Benchmark-Obs
 | CP1 · Localhost vs Production | ✅ Xong | `MISSION_ANSWERS.md` mục Part 1 |
 | CP2 · Docker | ✅ Xong | `MISSION_ANSWERS.md` mục Part 2 |
 | CP3 · API Security | ✅ Xong | `MISSION_ANSWERS.md` mục Part 4 |
-| CP4 · Scaling & Reliability | ⏳ | |
+| CP4 · Scaling & Reliability | ✅ Xong | `MISSION_ANSWERS.md` mục Part 5 |
 | CP5 · Final Project | ⏳ | |
 | CP6 · Cloud Deployment | ⏳ | |
 | CP7 · Benchmark local | ⏳ | |
@@ -254,3 +254,83 @@ Kết quả: mỗi request $1.8, request 1–5 OK (tổng $9.00), request 6–7 
 - [x] `MISSION_ANSWERS.md` mục Part 4: output `curl -i` các trường hợp 401, 403, 200, 429 (đã che token); giải thích JWT flow, thuật toán rate limit; cách làm cost guard kèm code và kết quả chạy với Redis.
 - [x] Tự kiểm tra: thấy 429 bằng vòng lặp curl của chính mình (từ request thứ 11).
 - [x] Đã tắt server, dừng container Redis tạm; cổng 8000 trống.
+
+---
+
+## CP4 — Scaling & Reliability / Part 5 (2026-11-26)
+
+**Mục tiêu:** chạy nhiều instance mà không mất state, tắt không cắt ngang request.
+**Thư mục:** `05-scaling-reliability/`. Làm theo lưu ý K5 số 7.
+
+### Bước 1 — Exercise 5.1: health check (`develop/`)
+
+Bản develop đã có sẵn `/health` và `/ready`, chỉ chạy và đọc code.
+
+```bash
+cd 05-scaling-reliability/develop
+pip install -r requirements.txt     # có psutil
+python app.py
+curl http://localhost:8000/health   # 200, có check memory
+curl http://localhost:8000/ready    # 200, in_flight_requests
+curl -X POST "http://localhost:8000/ask?question=hello"   # 200, ~2.8 s (mock delay 3 s)
+```
+
+### Bước 2 — Exercise 5.2: graceful shutdown
+
+Gửi 2 request `/ask` song song → sau 0.5 s `kill -TERM <PID>` → sau 0.3 s gửi request thứ 3.
+
+| Request | Kết quả |
+|---|---|
+| req1, req2 (đang chạy khi SIGTERM) | **200**, mỗi cái 5.7 s |
+| req3 (gửi sau SIGTERM) | Không được nhận (HTTP 000, curl exit 56) |
+| Process | Thoát với **exit code 0** |
+
+Log thấy thứ tự: `Shutting down` → 2 dòng `200 OK` → `Graceful shutdown initiated` → `Shutdown complete` → `Finished server process`.
+
+### Bước 3 — Exercise 5.3: stateless (`production/app.py`)
+
+Đọc code: session lưu `SETEX session:<id> 3600 <json>` trong Redis. Thí nghiệm ngược: chạy 2 instance `uvicorn app:app --port 8001/8002` với `REDIS_URL` trỏ tới cổng không có Redis (app tự rơi về in-memory). Tạo session ở 8001 → đọc history ở 8002 trả **404**.
+
+### Bước 4 — Exercise 5.4: load balancing
+
+```bash
+cd 05-scaling-reliability/production
+touch .env.local                    # bị .gitignore chặn
+docker compose -p k5-day14-scaling up -d --build --scale agent=3
+```
+
+- 5 container: agent-1/2/3 (healthy), nginx (8080), redis.
+- 6 request liên tiếp: `X-Served-By` lần lượt `.3 → .4 → .5 → .3 → .4 → .5` (round-robin).
+- 10 request, đếm trong `docker compose -p k5-day14-scaling logs agent`: agent-1: 3, agent-2: 4, agent-3: 3.
+
+### Bước 5 — Exercise 5.5: test stateless
+
+```bash
+python test_stateless.py
+```
+
+5 câu cùng session, được cả 3 instance phục vụ luân phiên; history đọc lại đủ 10 message.
+
+Thí nghiệm thêm (script không tự làm): tạo session → `docker stop k5-day14-scaling-agent-2` → gửi thêm 6 câu: đều **200**, chỉ agent-1 và agent-3 phục vụ, history đủ 7 câu (14 message), TTL key Redis 3599 s. `docker start` lại agent-2 → sau > 10 s agent-2 nhận traffic trở lại với `INSTANCE_ID` mới (`instance-5f18d3`).
+
+```bash
+docker compose -p k5-day14-scaling down
+```
+
+### Phát hiện thêm
+
+- `develop/app.py`: endpoint `async def` gọi `time.sleep(3)` đồng bộ nên **chặn event loop**, 2 request "song song" thực ra chạy nối tiếp (5.7 s). **Ghi nhớ cho CP5:** endpoint gọi hàm chặn nên khai báo `def` thường.
+- `production/app.py`: trường `turn` lệch +1; `append_to_history` là read-modify-write (có thể mất message nếu 2 request đồng thời cùng session); không có Redis thì âm thầm rơi về in-memory.
+- Nginx giữ instance chết ngoài vòng chia trong `fail_timeout` (10 s mặc định) sau khi nó sống lại.
+- **Ghi nhớ cho CP5:** `/health` không phụ thuộc Redis (luôn 200), `/ready` ping Redis (503 khi mất Redis), giống `production/app.py` của Part 5.
+
+### Lỗi gặp phải và cách xử lý
+
+| Lỗi | Xử lý |
+|---|---|
+| Đoạn Python đọc header `X-Served-By` từ `curl -D -` báo `IndexError` | Đổi sang `curl -i` rồi `tr -d '\r'` và `grep -i '^x-served-by'` |
+
+### Kết quả CP4
+
+- [x] `MISSION_ANSWERS.md` mục Part 5: health/ready, graceful shutdown có log, stateless có thí nghiệm in-memory 404, load balancing có phân bố request, output `test_stateless.py` kèm giải thích, thí nghiệm tắt 1 instance.
+- [x] Tự kiểm tra: đã chạy `docker compose -p k5-day14-scaling up -d --build --scale agent=3` + `python test_stateless.py` và giải thích kết quả; đã `down`.
