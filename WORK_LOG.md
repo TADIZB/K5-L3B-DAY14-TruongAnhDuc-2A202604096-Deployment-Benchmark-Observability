@@ -27,7 +27,7 @@ cd "/mnt/d/Coding/K5-L3B-DAY14-TruongAnhDuc-2A202604096-Deployment-Benchmark-Obs
 | CP3 · API Security | ✅ Xong | `MISSION_ANSWERS.md` mục Part 4 |
 | CP4 · Scaling & Reliability | ✅ Xong | `MISSION_ANSWERS.md` mục Part 5 |
 | CP5 · Final Project | ✅ Xong — PASS 12/12 | Code `06-lab-complete/`, `MISSION_ANSWERS.md` mục Part 6 |
-| CP6 · Cloud Deployment | ⏳ | |
+| CP6 · Cloud Deployment | ✅ Xong (còn chụp 3 ảnh) | `DEPLOYMENT.md`, `MISSION_ANSWERS.md` mục Part 3 |
 | CP7 · Benchmark local | ⏳ | |
 | CP8 · Observability + nộp | ⏳ | |
 
@@ -411,3 +411,94 @@ Kết quả: thiếu/sai key → 401; đúng key → 200; body sai (rỗng, thi�
 - [x] Dán phần "📋 Checklist Deliverable" vào `MISSION_ANSWERS.md` mục Part 6.
 - [x] Không sửa `check_production_ready.py`; không commit `.env` (đã xoá file `.env` tạm).
 - [x] Đã `down -v` stack `k5-day14-final`; script chấm tự dọn container/image tạm.
+
+---
+
+## CP6 — Cloud Deployment / Part 3 (2026-11-26)
+
+**Mục tiêu:** agent Part 6 chạy trên cloud với URL public, có Redis và API key.
+**Nền tảng chính:** Railway. Deploy thư mục `06-lab-complete/` (lưu ý K5 số 8), không deploy app mẫu `03-cloud-deployment/`.
+
+### Bước 1 — Cài CLI và đăng nhập
+
+```bash
+npm i -g @railway/cli        # railway 5.75.0 (Node 22 trên Windows)
+railway login                # tự đăng nhập trên trình duyệt
+```
+
+### Bước 2 — Tạo project, Redis, service agent
+
+```bash
+cd 06-lab-complete
+railway init --name day14-agent      # project day14-agent, environment production
+railway add --database redis         # service "Redis" (redis:8.2, volume /data)
+railway add --service agent          # service rỗng cho agent
+```
+
+### Bước 3 — Đặt biến môi trường (không ghi vào code)
+
+```bash
+railway variable set ENVIRONMENT=production RATE_LIMIT_PER_MINUTE=10 DAILY_BUDGET_USD=1.0 \
+  MONTHLY_BUDGET_USD=10.0 LOG_LEVEL=INFO 'REDIS_URL=${{Redis.REDIS_URL}}' --service agent --skip-deploys
+# Key sinh ngẫu nhiên, lưu ở .env.deploy (gốc repo, bị .gitignore chặn bởi .env.*), đặt qua stdin
+python -c "import secrets; print(secrets.token_urlsafe(32))" > .env.deploy
+tr -d '\r\n' < .env.deploy | railway variable set AGENT_API_KEY --stdin --service agent --skip-deploys
+```
+
+Kiểm tra: `REDIS_URL` trên Railway đã được resolve thành `redis://***@redis.railway.internal:...` (không còn chuỗi `${{...}}`).
+
+### Bước 4 — Deploy và lấy domain
+
+```bash
+railway up --service agent --ci      # build bằng Dockerfile theo railway.toml → "Deploy complete"
+railway domain --service agent       # https://agent-production-7dc48df9.up.railway.app
+railway status                       # agent ● Online
+```
+
+### Bước 5 — Tự kiểm tra (4 lệnh CP6)
+
+| Lệnh | Kết quả |
+|---|---|
+| `GET /health` | **200** |
+| `GET /ready` | **200** `{"ready":true,"redis":"ok"}` |
+| `POST /ask` không key | **401** |
+| `POST /ask` có key | **200** |
+
+Thêm:
+- 12 request liên tiếp → `200 ×8, 429 ×4` (cộng 2 request trước = 10/phút), `retry-after: 42`.
+- `/docs` → 404 (tắt khi `ENVIRONMENT=production`).
+- `railway logs --service agent`: Railway tự parse log JSON thành field.
+- `python check_production_ready.py --public-url https://agent-production-7dc48df9.up.railway.app` (WSL, đầy đủ, có Docker) → **PASS 12/12 · 44/44 checks · exit code 0**.
+
+### Bước 6 — Viết tài liệu
+
+- `DEPLOYMENT.md` (gốc repo) theo mẫu DAY14_DELIVERY_CHECKLIST mục 3: URL, platform, lệnh deploy, test commands + kết quả, bảng biến môi trường (không ghi key), logs, link ảnh.
+- `MISSION_ANSWERS.md` mục Part 3:
+  - 3.1: URL + kết quả.
+  - 3.2: bảng so sánh `railway.toml` / `render.yaml`, 11 khía cạnh (lấy 3 điểm "nền tảng còn lại").
+  - 3.3: 4 bước pipeline Cloud Build + `service.yaml` (1 điểm).
+- Tạo thư mục `screenshots/`.
+
+### Phát hiện thêm
+
+- Railway CLI cảnh báo `railway.toml` (Config as Code) bị deprecate, vẫn chạy tới **2026-12-01**. Đề và script chấm vẫn yêu cầu `railway.toml` nên giữ nguyên; service đã deploy không bị ảnh hưởng.
+- `03-cloud-deployment/production-cloud-run/` không có thư mục `tests/` mà bước 1 của `cloudbuild.yaml` gọi `pytest tests/`.
+
+### Lỗi gặp phải và cách xử lý
+
+| Lỗi | Xử lý |
+|---|---|
+| `sed -n "/12. Public URL/,$p"` lỗi khi truyền qua `wsl bash -lc` (ký tự `$` bị escape) | Dùng `tail -32` để xem cuối output |
+
+### Còn phải tự làm (cần trình duyệt, không tự động được)
+
+- [ ] `screenshots/dashboard.png`: Railway dashboard của project `day14-agent` (thấy 2 service agent + Redis, `railway open` để mở).
+- [ ] `screenshots/running.png`: service agent → tab Deployments, bản deploy **Active / Online** (hoặc tab Logs có log JSON).
+- [ ] `screenshots/test.png`: terminal chạy 4 lệnh tự kiểm ra 200 / 200 / 401 / 200 (lệnh chỉ in mã HTTP nên không lộ key).
+
+### Kết quả CP6
+
+- [x] URL public chạy đúng 4 lệnh tự kiểm.
+- [x] `DEPLOYMENT.md`; mục Part 3 của `MISSION_ANSWERS.md` (URL, so sánh Railway/Render, Cloud Run).
+- [x] `AGENT_API_KEY`, `REDIS_URL` đặt trên Railway, không có trong code/repo (đã grep: key không xuất hiện trong file nào ngoài `.env.deploy` bị gitignore).
+- [ ] 3 ảnh trong `screenshots/`.
