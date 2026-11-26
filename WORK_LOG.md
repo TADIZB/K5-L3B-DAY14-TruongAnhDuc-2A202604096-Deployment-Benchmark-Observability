@@ -26,7 +26,7 @@ cd "/mnt/d/Coding/K5-L3B-DAY14-TruongAnhDuc-2A202604096-Deployment-Benchmark-Obs
 | CP2 · Docker | ✅ Xong | `MISSION_ANSWERS.md` mục Part 2 |
 | CP3 · API Security | ✅ Xong | `MISSION_ANSWERS.md` mục Part 4 |
 | CP4 · Scaling & Reliability | ✅ Xong | `MISSION_ANSWERS.md` mục Part 5 |
-| CP5 · Final Project | ⏳ | |
+| CP5 · Final Project | ✅ Xong — PASS 12/12 | Code `06-lab-complete/`, `MISSION_ANSWERS.md` mục Part 6 |
 | CP6 · Cloud Deployment | ⏳ | |
 | CP7 · Benchmark local | ⏳ | |
 | CP8 · Observability + nộp | ⏳ | |
@@ -334,3 +334,80 @@ docker compose -p k5-day14-scaling down
 
 - [x] `MISSION_ANSWERS.md` mục Part 5: health/ready, graceful shutdown có log, stateless có thí nghiệm in-memory 404, load balancing có phân bố request, output `test_stateless.py` kèm giải thích, thí nghiệm tắt 1 instance.
 - [x] Tự kiểm tra: đã chạy `docker compose -p k5-day14-scaling up -d --build --scale agent=3` + `python test_stateless.py` và giải thích kết quả; đã `down`.
+
+---
+
+## CP5 — Final Project / Part 6 (2026-11-26)
+
+**Mục tiêu:** sửa hết `TODO` trong `06-lab-complete/` tới khi `check_production_ready.py` báo `PASS 12/12`.
+**Thư mục:** `06-lab-complete/` (làm ngay tại đây, theo lưu ý K5 số 1). Không sửa `check_production_ready.py`.
+
+### Bước 1 — Đọc yêu cầu và mốc xuất phát
+
+Đọc `06-lab-complete/README.md` (bảng *Script chấm dựa vào những tiêu chí dưới đây*), CODE_LAB Part 6 và **toàn bộ `check_production_ready.py`** để biết chính xác script kiểm gì:
+- chạy `uvicorn app.main:app --workers 2` với `ENVIRONMENT=staging`, API key ngẫu nhiên, `RATE_LIMIT_PER_MINUTE=5`;
+- restart agent để kiểm state rate limit nằm trong Redis;
+- trỏ `REDIS_URL` tới cổng chết để kiểm `/ready` 503;
+- đặt budget `0.000001` để kiểm 402;
+- SIGTERM khi đang có request;
+- build image, đo size, `docker stop` phải exit 0 trong < 10 s.
+
+```bash
+cd 06-lab-complete
+pip install -r requirements.txt
+python check_production_ready.py --static-only    # 0/12 tiêu chí · 5/24 checks
+```
+
+### Bước 2 — Viết code theo thứ tự gợi ý
+
+`config.py` → `redis_client.py` → `auth.py` → `rate_limiter.py` → `cost_guard.py` → `main.py` (log JSON, `/health`, `/ready`, nối `/ask`, exception handler, lifespan) → `Dockerfile` → `.dockerignore` → `docker-compose.yml` → `.env.example` → `railway.toml` + `render.yaml`. Chi tiết từng file: bảng trong MISSION_ANSWERS Part 6.
+
+Áp dụng các ghi nhớ từ CP1–CP4:
+- CP1: `logging.basicConfig(..., force=True)`.
+- CP2: formatter `json.dumps` cả dòng log, không ghép chuỗi.
+- CP3: sai key trả **401** (không phải 403); rate limit + cost guard lưu Redis, không lưu RAM.
+- CP4: `/health` không phụ thuộc Redis, `/ready` ping Redis; endpoint `/ask` là `def` thường để `time.sleep` không chặn event loop.
+
+### Bước 3 — Chạy script chấm
+
+| Lần | Lệnh | Kết quả |
+|---|---|---|
+| 1 | `--static-only` (bản khung) | 0/12 · 5/24 checks |
+| 2 | `--skip-docker` | 10/12 · 39/39 checks (2 mục ⚠️ cần Docker) |
+| 3 | đầy đủ | **PASS 12/12 · 43/43 checks · exit code 0** |
+
+Số đo trong lần chạy đầy đủ: image 63 MB; 429 sau 5 request; restart vẫn 429; 15 dòng log JSON; SIGTERM giữa request → 200, exit 0; `docker stop` 1.3 s, exit 0.
+
+### Bước 4 — Test bằng tay qua Docker Compose
+
+```bash
+# .env tạm với AGENT_API_KEY ngẫu nhiên (gitignore, xoá sau khi test)
+docker compose -p k5-day14-final up -d --build
+# ... các lệnh curl, xem MISSION_ANSWERS Part 6
+docker compose -p k5-day14-final down -v
+```
+
+Kết quả: thiếu/sai key → 401; đúng key → 200; body sai (rỗng, thiếu field, JSON hỏng, > 2000 ký tự) → 422; quá 10 request/phút → 429 kèm `Retry-After`; `docker compose restart agent` vẫn 429; dừng Redis → `/health` 200, `/ready` 503, `/ask` 503 (không lộ stack trace), bật lại → `/ready` 200; container chạy uid 999, PID 1 là uvicorn; log không chứa API key; `docker stop` 1.34 s, exit 0.
+
+Đánh dấu `[x]` 12 mục *Checklist Deliverable* trong `06-lab-complete/README.md`.
+
+### Phát hiện thêm
+
+- Cost guard báo 402 ngay request thứ 1 trong bài test của script, vì các lần chạy trước trong cùng Redis tạm đã cộng chi phí vượt 0.000001 USD. Đúng hành vi: budget là tổng chung theo ngày.
+- Khi Redis bị dừng, `/ask` mất ~8 s mới trả 503 (chờ timeout kết nối/DNS). Có thể cải thiện bằng circuit breaker.
+- `docker images` báo image Part 6 là 286 MB (dung lượng trên đĩa của Docker Desktop), còn `docker image inspect` (script chấm dùng) là 63 MB; cả hai đều < 500 MB.
+
+### Lỗi gặp phải và cách xử lý
+
+| Lỗi | Nguyên nhân | Xử lý |
+|---|---|---|
+| Lần chạy đầy đủ đầu tiên bị cắt giữa chừng, Redis tạm báo `docker run redis thất bại` | Pipe output qua `tee ... \| head -30`: `head` đóng pipe sớm làm script bị ngắt | Chạy lại, ghi toàn bộ output vào file `/tmp/check_full.txt` rồi mới đọc → PASS 12/12 |
+| Lo ngại comment cùng dòng trong `.env.example` (`ENVIRONMENT=development  # ...`) bị đọc thành giá trị | Không phải parser `.env` nào cũng bỏ comment cùng dòng | Chuyển comment lên dòng riêng |
+| `render.yaml` dùng `rootDir` + đường dẫn tương đối dễ hiểu nhầm gốc | File nằm trong thư mục con | Dùng `dockerfilePath: ./06-lab-complete/Dockerfile`, `dockerContext: ./06-lab-complete` (tính từ gốc repo) |
+
+### Kết quả CP5
+
+- [x] `python check_production_ready.py` (đầy đủ, có Docker, trong WSL) → **`PASS 12/12`**.
+- [x] Dán phần "📋 Checklist Deliverable" vào `MISSION_ANSWERS.md` mục Part 6.
+- [x] Không sửa `check_production_ready.py`; không commit `.env` (đã xoá file `.env` tạm).
+- [x] Đã `down -v` stack `k5-day14-final`; script chấm tự dọn container/image tạm.
