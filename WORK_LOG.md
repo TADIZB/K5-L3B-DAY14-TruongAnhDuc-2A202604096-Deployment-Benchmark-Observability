@@ -24,7 +24,7 @@ cd "/mnt/d/Coding/K5-L3B-DAY14-TruongAnhDuc-2A202604096-Deployment-Benchmark-Obs
 | CP0 · Setup | ✅ Xong | Repo đúng tên, Public; venv WSL; Docker chạy `hello-world` |
 | CP1 · Localhost vs Production | ✅ Xong | `MISSION_ANSWERS.md` mục Part 1 |
 | CP2 · Docker | ✅ Xong | `MISSION_ANSWERS.md` mục Part 2 |
-| CP3 · API Security | ⏳ | |
+| CP3 · API Security | ✅ Xong | `MISSION_ANSWERS.md` mục Part 4 |
 | CP4 · Scaling & Reliability | ⏳ | |
 | CP5 · Final Project | ⏳ | |
 | CP6 · Cloud Deployment | ⏳ | |
@@ -175,3 +175,82 @@ Không gặp lỗi. Đã tạo `.env.local` trước nên `docker compose up` kh
 - [x] `MISSION_ANSWERS.md` mục Part 2: 4 câu Exercise 2.1, kết quả gọi container, kích thước image đo được kèm %, sơ đồ stack 2.4, kết quả test qua Nginx.
 - [x] Tự kiểm tra: số MB là số đo trên máy (1.67 GB / 240 MB), không chép từ README (README ghi ~800 MB / ~160 MB).
 - [x] Đã xoá container `p2-develop`, `p2-adv` và dọn stack (`down -v`); cổng 80, 8000 trống.
+
+---
+
+## CP3 — API Security / Part 4 (2026-11-26)
+
+**Mục tiêu:** chặn truy cập trái phép, gọi quá nhanh và tiêu quá ngân sách.
+**Thư mục:** `04-api-gateway/`. Làm theo lưu ý K5 số 6.
+
+### Bước 1 — Exercise 4.1: API key (`develop/`)
+
+```bash
+cd 04-api-gateway/develop
+pip install -r requirements.txt
+AGENT_API_KEY=secret-key-123 python app.py
+```
+
+| Trường hợp | Kết quả |
+|---|---|
+| Không có `X-API-Key` | **401** `Missing API key` |
+| Key sai | **403** `Invalid API key.` |
+| Key đúng `secret-key-123` | **200** |
+| `/health` không key | 200 (public) |
+
+Đọc code: check ở dependency `verify_api_key` (L39-54), gắn vào `/ask` bằng `Depends` (L70). Rotate key: đổi env `AGENT_API_KEY` rồi restart, không sửa code.
+
+### Bước 2 — Exercise 4.2: JWT (`production/`)
+
+Tắt bản develop, `pip install -r requirements.txt`, `python app.py`. Lấy token ở `POST /auth/token` với `student` / `demo123` (không phải `/token` và `admin`/`secret` như CODE_LAB).
+
+| Trường hợp | Kết quả |
+|---|---|
+| Sai mật khẩu | 401 `Invalid credentials` |
+| Đúng mật khẩu | 200, trả `access_token` (đã che khi dán vào bài) |
+| `/ask` không token | **401**, header `www-authenticate: Bearer` |
+| `/ask` token giả `abc.def.ghi` | 403 `Invalid token.` |
+| `/ask` token đúng | **200**, `requests_remaining: 9` |
+
+Decode payload token: `{'sub': 'student', 'role': 'user', 'iat': ..., 'exp': ...}`, `exp − iat = 3600 s`. JWT chỉ được ký, không mã hoá.
+
+### Bước 3 — Exercise 4.3: Rate limit
+
+Vòng lặp 20 request với token student: request 1–9 trả **200** (`requests_remaining` giảm 8 → 0), request 10–20 trả **429** (tổng 10 request thành công tính cả request ở bước 2 = đúng limit 10/phút). Response 429 có header `retry-after: 61`, `x-ratelimit-limit: 10`, `x-ratelimit-remaining: 0`.
+
+Thêm: token `teacher` (admin) gửi 15 request đều 200 (limit 100/phút); `/admin/stats` bằng token student → 403, teacher → 200; `question` rỗng → 422.
+
+Thuật toán: sliding window log (deque timestamp mỗi user, cửa sổ 60 s), lưu trong RAM.
+
+### Bước 4 — Exercise 4.4: Cost guard
+
+Đọc `production/cost_guard.py` (in-memory, $1/ngày/user → 402, $10/ngày toàn hệ thống → 503). Tự viết `check_budget(user_id, estimated_cost)` theo đề ($10/tháng, Redis, reset đầu tháng) trong một **script thử ở scratchpad** (không sửa code của đề), dùng Lua script để đọc + so sánh + cộng nguyên khối (tránh race khi nhiều instance).
+
+```bash
+docker run -d --rm --name p4-redis -p 6390:6379 redis:7-alpine
+pip install redis
+python p4_cost_guard.py redis://localhost:6390/0
+docker stop p4-redis
+```
+
+Kết quả: mỗi request $1.8, request 1–5 OK (tổng $9.00), request 6–7 bị chặn (402), tổng giữ $9.00; key `budget:student:2026-11` TTL 2 764 800 s (32 ngày); user `teacher` không bị ảnh hưởng.
+
+### Phát hiện thêm
+
+- **Bản develop trả 403 khi sai key**, còn script chấm Part 6 yêu cầu **401 cho cả thiếu và sai key**. **Ghi nhớ cho CP5** (`06-lab-complete/app/auth.py`).
+- `retry_after_seconds` luôn ra 61 thay vì ≤ 60 do `int(...) + 1`.
+- Response `/ask` có `budget_remaining_usd` nhưng giá trị là số **đã dùng** (`usage.total_cost_usd`); `/me/usage` mới cho số còn lại đúng (`0.999802`).
+- Rate limiter và cost guard của bản này lưu trong RAM: nhiều instance thì đếm riêng, restart là mất. Part 6 phải dùng Redis (script chấm kiểm state còn sau khi restart).
+
+### Lỗi gặp phải và cách xử lý
+
+| Lỗi | Xử lý |
+|---|---|
+| Bản develop và production đều `reload=True` nên có 2 process | Tắt bằng `pkill -TERM -P <pid>` rồi `kill -TERM <pid>` để tắt cả reloader lẫn worker |
+| Token không được lộ khi dán vào bài | Lọc output qua `sed` thay `eyJ...` thành `eyJ***MASKED***` |
+
+### Kết quả CP3
+
+- [x] `MISSION_ANSWERS.md` mục Part 4: output `curl -i` các trường hợp 401, 403, 200, 429 (đã che token); giải thích JWT flow, thuật toán rate limit; cách làm cost guard kèm code và kết quả chạy với Redis.
+- [x] Tự kiểm tra: thấy 429 bằng vòng lặp curl của chính mình (từ request thứ 11).
+- [x] Đã tắt server, dừng container Redis tạm; cổng 8000 trống.
