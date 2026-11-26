@@ -29,7 +29,7 @@ cd "/mnt/d/Coding/K5-L3B-DAY14-TruongAnhDuc-2A202604096-Deployment-Benchmark-Obs
 | CP5 · Final Project | ✅ Xong — PASS 12/12 | Code `06-lab-complete/`, `MISSION_ANSWERS.md` mục Part 6 |
 | CP6 · Cloud Deployment | ✅ Xong (còn chụp 3 ảnh) | `DEPLOYMENT.md`, `MISSION_ANSWERS.md` mục Part 3 |
 | CP7 · Benchmark local | ✅ Xong | `BENCHMARK_REPORT.md` mục 1–3, `reports/` (10 JSON), `.github/workflows/eval.yml` |
-| CP8 · Observability + nộp | ⏳ | |
+| CP8 · Observability + nộp | ✅ Xong | `BENCHMARK_REPORT.md` mục 4–6, `benchmark-results/`, 4 ảnh Part 7 |
 
 ---
 
@@ -594,3 +594,94 @@ python eval/run_eval.py --url http://localhost:8002 --min-accuracy 1.0 --baselin
 - [x] Trong `develop/reports/` có đủ: `load_v2_c1/c10/c50/c100.json`, `load_v2_slow_0/0.03/0.1.json`, `eval_v1.json`, `eval_v2.json`, `eval_v2_fixed.json` (đã chép ra `reports/` ở gốc).
 - [x] `BENCHMARK_REPORT.md` ở gốc repo đã điền mục 1–3.
 - [x] Tự kiểm tra: lệnh eval cuối in `Quality gate ... ✅ PASS` và `reports/eval_v2_fixed.json` tồn tại.
+
+---
+
+## CP8 — Observability stack + nộp bài / Part 7 Bước 2 (2026-11-26)
+
+**Mục tiêu:** nhìn được sức khoẻ agent khi chạy (metrics, trace, alert) và nộp đủ bằng chứng.
+**Thư mục:** `06-lab-complete/benchmark-observability/production/`, project Compose `-p k5-day14-observability`.
+
+### Bước 1 — Bật stack, sửa lỗi Dockerfile
+
+```bash
+docker compose -p k5-day14-observability up -d --build --scale agent=1
+```
+
+- Agent crash liên tục: `ModuleNotFoundError: No module named 'uvicorn'`. Nguyên nhân: `useradd -d /app` làm home của user `agent` là `/app`, Python tìm user site-packages ở `/app/.local`, còn package nằm ở `/home/agent/.local`. Sửa `production/Dockerfile`: thêm `ENV PYTHONUSERBASE=/home/agent/.local`.
+- Kiểm tra:
+  - `/ask` qua Nginx → 200, có `X-Trace-ID`, `X-Served-By`.
+  - `/metrics` qua Nginx → 404; `/ask` không key → 401.
+  - Prometheus target `agent` up.
+  - `promtool test rules` → `SUCCESS`.
+- (curl trên Git Bash gửi câu hỏi tiếng Việt bị 400 vì sai mã hoá; dùng câu tiếng Anh hoặc gọi từ trong container.)
+
+### Bước 2 — Benchmark scaling (mục 5)
+
+- Lần 1 dùng đúng lệnh CHECKPOINTS (`docker compose run --rm locust ...`). Kiểm tra thấy **sai**: `compose run` khởi động lại phụ thuộc và đưa agent về `replicas: 2` (log: `agent-2 Creating`, `agent-3 Removed`; Prometheus: `172.21.0.9` nhận 0 request).
+- Đo lại với `--no-deps`, kiểm số instance trước/sau mỗi lần:
+
+| Instance | RPS | p50 | p95 | p99 | Failures | Phân bố |
+|---|---:|---:|---:|---:|---|---|
+| 1 | 64.16 | 200 | 350 | 1700 | 63/7111 | 7356 request vào 1 instance |
+| 3 | 64.30 | 200 | 240 | 1700 | 69/7122 | 2419 / 2403 / 2433 |
+
+- RPS bị giới hạn bởi think time của Locust (~67 req/s tối đa); p95 giảm 31 % vì 1 instance 0.5 CPU đã bão hoà; p50/p99 do LLM quyết định.
+
+### Bước 3 — Exercise 7.4: đọc dashboard (30 user nền, 2 instance)
+
+Chạy Locust nền: `docker compose ... run -d --rm --no-deps --name k5-bg-load locust ... -u 30 -r 5 -t 90m`.
+
+Đo bằng PromQL (script `promq.py` gọi `/api/v1/query`):
+- p50 181 ms, p95 296 ms, p99 1865 ms, avg 247 ms.
+- 2 instance 6.6 / 6.4 req/s.
+- Input 1012 tokens/s so với output 537 tokens/s (78.7 / 41.8 mỗi call).
+- Lỗi 1.4 %.
+
+Phát hiện: `LLMCostBurnRateHigh` firing từ 10:04:57 ngay lúc benchmark 100 user; ở 30 user chi phí 2.2–4.3 $/giờ vẫn > ngưỡng 2 $/giờ.
+
+### Bước 4 — Exercise 7.5: tracing
+
+- Jaeger 2.23 chỉ có API v3 (`/api/v3/traces`, định dạng OTLP); `/api/traces` cũ trả 404. Viết script `jaegerq.py` tìm trace.
+- Trace chậm nhất: `f4d74e984a9653e20dcc3bcaa8ffe3f7`, 2043.2 ms, span `chat mock-llm-small` 1669.8 ms (81.7 %).
+- Trace lỗi: `d9e1bbd454fef1fc9a6f3fb5565cf282`, event `exception` `LLMError: Upstream LLM error: 503`.
+- Grep log theo `trace_id` ra đúng các dòng `llm_call` / `llm_error` + `http_request`.
+
+### Bước 5 — Exercise 7.6: phá hệ thống
+
+`cp .env.example .env`, sửa từng biến, `docker compose -p k5-day14-observability up -d --scale agent=2`, rồi poll `/api/v1/rules` mỗi ~10 s:
+
+| # | Thay đổi | Alert | Đổi → firing |
+|---|---|---|---|
+| A | `MOCK_ERROR_RATE=0.2` | `AgentHighErrorRate` | ~94 s |
+| B | `MOCK_SLOW_RATE=0.3` (giữ A) | `AgentHighLatencyP95` | ~146 s |
+| C | `LLM_MODEL=mock-llm-large` | `LLMCostBurnRateHigh` | ~143 s (1.72 → 17.75 $/giờ) |
+| D | `docker pause ...-agent-1` | `AgentInstanceDown` | ~49 s |
+| E | `AGENT_VERSION=v1` | không có (10:39:19 cả 4 alert inactive) | — |
+
+- Khi A + B cùng firing, nhờ chụp 4 ảnh: `prometheus-alert-firing.png`, `grafana-dashboard.png`, `jaeger-slow-trace.png`, `jaeger-error-trace.png`. Đã mở xem lại từng ảnh.
+- D: Nginx log có 504 `upstream timed out` khoảng 10–20 s một lần, error rate của agent vẫn xanh.
+- Mỗi lần `up -d` tạo lại cả 2 agent cùng lúc gây 285 lỗi 502 `no live upstreams` trong ~20 s (không có rolling update).
+
+### Bước 6 — Báo cáo, dọn dẹp, gom file
+
+- Điền `BENCHMARK_REPORT.md` mục 4 (Exercise 7.4, ảnh, bảng A–E, câu hỏi E, trace + log), mục 5 (scaling + ghi chú lỗi lệnh đề), mục 6 (kết luận). Đối chiếu số với CSV bằng script.
+- Xoá `production/.env` thử nghiệm; `docker rm -f k5-bg-load`; `docker compose -p k5-day14-observability down -v`.
+- Chép CSV ra gốc: `cp -r .../production/benchmark-results/. benchmark-results/` (bỏ `.gitkeep`).
+
+### Lỗi gặp phải và cách xử lý
+
+| Lỗi | Xử lý |
+|---|---|
+| Agent crash `No module named 'uvicorn'` | `ENV PYTHONUSERBASE=/home/agent/.local` trong `production/Dockerfile` |
+| `docker compose run` (lệnh đề) làm sai số instance khi benchmark scale | Thêm `--no-deps`, kiểm số instance trước/sau, đo lại |
+| Jaeger `/api/traces` 404 | Dùng API v3 `/api/v3/traces` |
+| Bash tool chặn `sleep` dài ở đầu lệnh | Chạy vòng chờ alert ở chế độ nền (background), nhận thông báo khi xong |
+| Python trên Windows in tiếng Việt lỗi `charmap` | `PYTHONIOENCODING=utf-8` |
+
+### Kết quả CP8
+
+- [x] `BENCHMARK_REPORT.md` điền đủ mục 1–6, số khớp JSON/CSV.
+- [x] `benchmark-results/scale_1_stats.csv`, `scale_3_stats.csv` (gốc repo và `production/benchmark-results/`).
+- [x] 4 ảnh Part 7 trong `screenshots/`; `prometheus-alert-firing.png` thấy 2 alert cùng firing.
+- [x] Đã dọn stack.
