@@ -23,7 +23,7 @@ cd "/mnt/d/Coding/K5-L3B-DAY14-TruongAnhDuc-2A202604096-Deployment-Benchmark-Obs
 |---|---|---|
 | CP0 · Setup | ✅ Xong | Repo đúng tên, Public; venv WSL; Docker chạy `hello-world` |
 | CP1 · Localhost vs Production | ✅ Xong | `MISSION_ANSWERS.md` mục Part 1 |
-| CP2 · Docker | ⏳ | |
+| CP2 · Docker | ✅ Xong | `MISSION_ANSWERS.md` mục Part 2 |
 | CP3 · API Security | ⏳ | |
 | CP4 · Scaling & Reliability | ⏳ | |
 | CP5 · Final Project | ⏳ | |
@@ -100,3 +100,78 @@ Ba thí nghiệm thêm để kiểm chứng bảng so sánh:
 - [x] `MISSION_ANSWERS.md` mục Part 1: 10 anti-pattern có số dòng, output gọi bản develop, bảng so sánh có cột giải thích.
 - [x] Tự kiểm tra: chỉ ra anti-pattern L17/L34 của develop đã được production sửa ở `config.py` và `app.py` L111-115.
 - [x] Đã tắt hết server, cổng 8000 trống cho CP2.
+
+---
+
+## CP2 — Docker (2026-11-26)
+
+**Mục tiêu:** đóng gói agent thành image nhỏ, chạy giống nhau ở mọi máy.
+**Thư mục:** `02-docker/`. Mọi lệnh `docker build` chạy từ **gốc repo** (lưu ý K5 số 4).
+
+### Bước 1 — Exercise 2.1: đọc `02-docker/develop/Dockerfile`
+
+Trả lời 4 câu: base `python:3.11`; `WORKDIR /app`; copy `requirements.txt` trước để tận dụng layer cache (layer `pip install` 53.3 MB không phải build lại khi chỉ sửa code); `CMD` là lệnh mặc định bị thay khi truyền lệnh vào `docker run`, `ENTRYPOINT` là phần cố định, tham số được nối thêm vào sau.
+
+### Bước 2 — Exercise 2.2: build và chạy image develop
+
+```bash
+docker build -f 02-docker/develop/Dockerfile -t my-agent:develop .
+docker run -d --name p2-develop -p 8000:8000 my-agent:develop
+curl -i -X POST "http://localhost:8000/ask?question=What%20is%20Docker%3F"   # 200
+curl http://localhost:8000/health                                           # 200
+docker exec p2-develop sh -c 'whoami; python --version'                     # root, Python 3.11.18
+docker rm -f p2-develop
+```
+
+Container develop chạy bằng **root**.
+
+### Bước 3 — Exercise 2.3: build image multi-stage và so sánh
+
+```bash
+docker build -f 02-docker/production/Dockerfile -t my-agent:advanced .
+docker images my-agent
+docker run -d --name p2-adv -p 8000:8000 my-agent:advanced
+docker exec p2-adv sh -c 'whoami; which gcc || echo "no gcc"'   # appuser, no gcc
+docker history my-agent:advanced
+docker rm -f p2-adv
+```
+
+| Image | `docker images` | `docker image inspect` (nén) |
+|---|---:|---:|
+| `my-agent:develop` | **1.67 GB** | 426 319 939 bytes |
+| `my-agent:advanced` | **240 MB** | 57 409 145 bytes |
+| Giảm | **85.6 %** | 86.5 % |
+
+Container advanced lên trạng thái `(healthy)` nhờ `HEALTHCHECK`, chạy bằng `appuser`, không có `gcc`.
+
+### Bước 4 — Exercise 2.4: Docker Compose stack
+
+```bash
+cd 02-docker/production
+touch .env.local                                   # lưu ý K5 số 5; đã bị .gitignore chặn
+docker compose -p k5-day14-docker up -d --build    # -p riêng theo lưu ý K5 số 7
+docker compose -p k5-day14-docker ps
+curl -i http://localhost/health                    # 200, Server: nginx
+curl -i -X POST http://localhost/ask -H "Content-Type: application/json" -d '{"question":"Explain microservices"}'   # 200
+curl -m 3 http://localhost:8000/health             # 000: agent không mở port ra host
+# 40 request song song → 28 × 200, 12 × 429 (Nginx limit_req 10 r/s, burst 20)
+docker compose -p k5-day14-docker exec agent python -c "import socket;print(socket.gethostbyname('redis'))"   # DNS theo tên service
+docker compose -p k5-day14-docker down -v
+```
+
+4 service: nginx (cổng 80/443) → agent:8000 → redis:6379, qdrant:6333, cùng network `internal`. Đã vẽ sơ đồ trong MISSION_ANSWERS.
+
+### Phát hiện thêm
+
+- Log của `02-docker/production/main.py` là JSON lồng trong chuỗi không escape (`"msg":"{"event": ...}"`), nên **không phải JSON hợp lệ**. **Ghi nhớ cho CP5:** dùng formatter tự `json.dumps` cả dòng log.
+- `docker images` trên Docker Desktop (containerd store) báo dung lượng trên đĩa, lớn hơn dung lượng nén của `docker image inspect`. Bài dùng số của `docker images` như đề yêu cầu.
+
+### Lỗi gặp phải và cách xử lý
+
+Không gặp lỗi. Đã tạo `.env.local` trước nên `docker compose up` không báo thiếu file.
+
+### Kết quả CP2
+
+- [x] `MISSION_ANSWERS.md` mục Part 2: 4 câu Exercise 2.1, kết quả gọi container, kích thước image đo được kèm %, sơ đồ stack 2.4, kết quả test qua Nginx.
+- [x] Tự kiểm tra: số MB là số đo trên máy (1.67 GB / 240 MB), không chép từ README (README ghi ~800 MB / ~160 MB).
+- [x] Đã xoá container `p2-develop`, `p2-adv` và dọn stack (`down -v`); cổng 80, 8000 trống.
